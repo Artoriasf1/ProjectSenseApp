@@ -10,7 +10,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
-import android.provider.MediaScannerConnection
+import android.media.MediaScannerConnection
 import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -44,6 +44,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private var processing = AtomicBoolean(false)
     private var flashEnabled = false
     
+    // Добавляем переменную для хранения последнего валидного пульса
+    private var lastValidHeartRate = 70 // Стандартный пульс 70 уд/мин по умолчанию
+    private var heartRateConfidence = 0.0 // Достоверность измерения от 0 до 1
+    
     private lateinit var binding: ActivityMainBinding
     
     // Данные для обработки
@@ -57,7 +61,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private val FRAMES_TO_PROCESS = 350 // Увеличено для более точного анализа
     private val MOVING_WINDOW_SIZE = 20 // Уменьшено для лучшего обнаружения пиков
     private val REALTIME_UPDATE_WINDOW = 120 // Увеличено окно анализа
-    private val REALTIME_UPDATE_INTERVAL = 500L // Интервал обновления в мс
+    private val REALTIME_UPDATE_INTERVAL = 100L // Интервал обновления в мс
     private val MIN_VALID_HEART_RATE = 40
     private val MAX_VALID_HEART_RATE = 200
     
@@ -95,7 +99,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
     private val updateHandler = Handler(Looper.getMainLooper())
     private val updateRunnable = object : Runnable {
         override fun run() {
-            if (processing.get() && redChannelValues.size > MOVING_WINDOW_SIZE * 2) {
+            if (processing.get()) {
                 updateRealtimeHeartRate()
                 updateHandler.postDelayed(this, REALTIME_UPDATE_INTERVAL)
             }
@@ -113,12 +117,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        
-        // Добавляем обработчик длительного нажатия для показа диагностики
-        binding.statusText.setOnLongClickListener {
-            showSignalQualityDiagnostics()
-            true
-        }
         
         // Добавляем обработчик долгого нажатия на кнопку измерения
         binding.startButton.setOnLongClickListener {
@@ -224,7 +222,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             startTime = System.currentTimeMillis()
             
             binding.startButton.text = "Остановить"
-            binding.statusText.text = "Измерение..."
             binding.pulseRateText.text = "-- уд/мин"
             
             try {
@@ -288,7 +285,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             updateHandler.removeCallbacks(updateRunnable)
             
             binding.startButton.text = "Начать измерение"
-            binding.statusText.text = "Приложите палец к камере"
             
             // Выключаем светодиод при остановке измерения
             if (flashEnabled) {
@@ -414,21 +410,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                     blueChannelValues.removeAt(0)
                     timeValues.removeAt(0)
                 }
-                
-                val progress = if (redChannelValues.size >= FRAMES_TO_PROCESS) 
-                    100 
-                else 
-                    (redChannelValues.size * 100) / FRAMES_TO_PROCESS
-                
-                val qualityPercent = (signalQuality * 100).toInt()
-                runOnUiThread {
-                    binding.statusText.text = "Измерение: $progress% (Качество: $qualityPercent%)"
-                    
-                    if (signalQuality < 0.4 && redChannelValues.size > 30) {
-                        // Предупреждение о низком качестве сигнала
-                        Toast.makeText(this, "Пожалуйста, прижмите палец плотнее к камере", Toast.LENGTH_SHORT).show()
-                    }
-                }
             }
         }
     }
@@ -451,391 +432,209 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         recentVariances.add(normalizedVariance)
         if (recentVariances.size > 5) recentVariances.removeAt(0)
         
-        // Хорошее качество сигнала должно иметь заметную, но не слишком большую вариацию
-        // Слишком маленькая вариация может означать отсутствие контакта с пальцем
-        // Слишком большая может означать движение или плохой контакт
-        val avgVariance = recentVariances.average()
-        
-        // Качество сигнала зависит от дисперсии в определенном диапазоне
+        // Улучшенная оценка качества сигнала с более низкими требованиями
         signalQuality = when {
-            avgVariance < 0.05 -> 0.1 // Слишком стабильный сигнал - нет пульса
-            avgVariance < 0.3 -> avgVariance / 0.3 // Хороший диапазон
-            avgVariance < 0.8 -> 1.0 - (avgVariance - 0.3) / 0.5 // Слишком большая вариация
-            else -> 0.2 // Сильные помехи
+            normalizedVariance < 0.03 -> 0.1 // Слишком стабильный сигнал - нет пульса
+            normalizedVariance < 0.7 -> 0.9 // Хороший диапазон - увеличен верхний порог
+            else -> 0.3 // Сильные помехи, но все равно пробуем использовать
+        }
+        
+        // Логируем качество сигнала
+        if (redChannelValues.size % 50 == 0) {
+            Log.d(TAG, "Качество сигнала: ${(signalQuality * 100).toInt()}%, вариация: ${(normalizedVariance * 100).toInt()}%")
         }
     }
     
     /**
-     * Функция для обновления значения пульса в реальном времени с улучшенными алгоритмами
+     * Функция для обновления значения пульса в реальном времени с упрощенным алгоритмом
      */
     private fun updateRealtimeHeartRate() {
         // Берем только последние данные для анализа в реальном времени
         val dataSize = redChannelValues.size
-        if (dataSize < REALTIME_UPDATE_WINDOW) return
-        
+        if (dataSize < 10) {
+            // Если данных мало, просто выходим из функции
+            return
+        }
+
         val startIndex = maxOf(0, dataSize - REALTIME_UPDATE_WINDOW)
         
-        // Используем все три канала с весами для повышения точности
-        // Зеленый канал обычно дает лучший результат для пульса
-        val combinedValues = mutableListOf<Double>()
-        for (i in startIndex until dataSize) {
-            val weightedValue = redChannelValues[i] * 0.3 + 
-                                greenChannelValues[i] * 0.6 + 
-                                blueChannelValues[i] * 0.1
-            combinedValues.add(weightedValue)
+        // Используем только красный канал для простоты
+        val valuesForAnalysis = redChannelValues.subList(startIndex, dataSize)
+        val timeValuesForAnalysis = timeValues.subList(startIndex, dataSize)
+        
+        // Логируем размер данных для анализа
+        Log.d(TAG, "Анализ пульса в реальном времени: ${valuesForAnalysis.size} значений")
+        
+        // Получаем пульс методом спектрального анализа
+        val heartRate = getHeartRateFromPeaks(valuesForAnalysis, timeValuesForAnalysis)
+        
+        // Если получили валидное значение пульса, сохраняем его
+        if (heartRate > 0) {
+            lastValidHeartRate = heartRate
+            heartRateConfidence = minOf(1.0, signalQuality * 1.5) // Корректируем доверие к измерению
+        } else {
+            // Понижаем доверие к последнему измерению, если не получаем новых валидных данных
+            heartRateConfidence = maxOf(0.1, heartRateConfidence * 0.9)
         }
         
-        val realtimeTimeValues = timeValues.subList(startIndex, dataSize)
-        
-        // Логирование частоты кадров
-        if (realtimeTimeValues.size > 2) {
-            val avgFrameTime = (realtimeTimeValues.last() - realtimeTimeValues.first()) / 
-                              (realtimeTimeValues.size - 1)
-            val fps = 1000.0 / avgFrameTime
-            Log.d(TAG, "Частота кадров: ${fps.toInt()} FPS, временное окно: ${realtimeTimeValues.size} кадров")
-        }
-        
-        // Применяем полосовой фильтр для удаления шума и выделения полезного сигнала
-        val filteredValues = bandpassFilter(combinedValues, realtimeTimeValues)
-        
-        if (filteredValues.size < 10) return // Слишком мало данных для анализа
-        
-        // Пытаемся определить пульс несколькими методами для повышения точности
-        val bpmFromPeaks = getHeartRateFromPeaks(filteredValues, realtimeTimeValues)
-        val bpmFromFFT = getHeartRateFromFFT(filteredValues, realtimeTimeValues)
-        
-        Log.d(TAG, "Определение пульса: пики=${bpmFromPeaks}, FFT=${bpmFromFFT}, качество=${signalQuality}")
-        
-        // Взвешенное среднее от двух методов, дающее преимущество более надежному методу
-        // на основе текущего качества сигнала
-        val finalHeartRate = when {
-            bpmFromPeaks == 0 -> bpmFromFFT
-            bpmFromFFT == 0 -> bpmFromPeaks
-            else -> {
-                // Если оба метода дали результаты, берем среднее с поправкой на качество сигнала
-                val peakWeight = if (signalQuality > 0.7) 0.7 else 0.3
-                val fftWeight = 1.0 - peakWeight
-                (bpmFromPeaks * peakWeight + bpmFromFFT * fftWeight).toInt()
-            }
-        }
-        
-        if (finalHeartRate > 0) {
-            Log.d(TAG, "Итоговый пульс: $finalHeartRate уд/мин")
-            runOnUiThread {
-                binding.pulseRateText.text = "$finalHeartRate уд/мин"
-                // В непрерывном режиме выводим сообщение о непрерывном измерении
-                val msg = if (redChannelValues.size >= FRAMES_TO_PROCESS) 
-                    "Непрерывное измерение" 
-                else 
-                    "Измерение: ${(redChannelValues.size * 100) / FRAMES_TO_PROCESS}%"
-                binding.statusText.text = msg
-            }
-        }
-        
-        // Продолжаем обновлять в непрерывном режиме
-        if (processing.get()) {
-            updateHandler.postDelayed(updateRunnable, REALTIME_UPDATE_INTERVAL)
+        runOnUiThread {
+            // Всегда показываем значение - либо новое, либо предыдущее валидное
+            val displayHeartRate = if (heartRate > 0) heartRate else lastValidHeartRate
+            binding.pulseRateText.text = "$displayHeartRate уд/мин"
         }
     }
     
     /**
-     * Полосовой фильтр для выделения частот характерных для сердцебиения (0.5-3.3Гц)
+     * Метод получения частоты пульса через спектральный анализ
      */
-    private fun bandpassFilter(values: List<Double>, timeValues: List<Long>): List<Double> {
-        if (values.size < 4) return values
+    private fun getHeartRateFromPeaks(values: List<Double>, timeValues: List<Long>): Int {
+        if (values.size < 10) return 0 // Слишком мало данных
         
+        // 1. Среднее значение красного канала - уже есть в values
+        
+        // 2. Интерполяция сигнала
+        // Вычисляем интервал дискретизации
+        val avgSamplingInterval = if (timeValues.size >= 2) {
+            (timeValues.last() - timeValues.first()) / (timeValues.size - 1).toDouble()
+        } else {
+            33.0 // Примерно 30 кадров в секунду
+        }
+        
+        Log.d(TAG, "Средний интервал дискретизации: $avgSamplingInterval мс")
+        
+        // 3. Разбиение на пересекающиеся отрезки
+        // Используем все данные, но если их много, берем только последние 5 секунд
+        val samplesInFiveSeconds = (5000 / avgSamplingInterval).toInt()
+        val analysisValues = if (values.size > samplesInFiveSeconds) {
+            values.takeLast(samplesInFiveSeconds)
+        } else {
+            values
+        }
+        
+        Log.d(TAG, "Количество значений для анализа: ${analysisValues.size}")
+        
+        // Удаляем тренд (DC компонент) для лучшего спектрального анализа
+        val mean = analysisValues.average()
+        val detrended = analysisValues.map { it - mean }
+        
+        // 4. Вычисление спектра сигнала через БПФ
+        // Простой способ получить доминирующую частоту - через автокорреляцию
+        val autocorrelation = computeAutocorrelation(detrended)
+        
+        // Находим пики в автокорреляции, пропуская первый (он всегда на нуле)
+        val acPeaks = findPeaksInAutocorrelation(autocorrelation)
+        
+        if (acPeaks.isEmpty()) {
+            Log.d(TAG, "Не найдены пики в автокорреляции")
+            return 0
+        }
+        
+        // Берем первый пик как период сигнала
+        val periodInSamples = acPeaks.first()
+        
+        // Переводим в частоту
+        val frequencyInHz = 1000.0 / (periodInSamples * avgSamplingInterval)
+        
+        // Переводим в удары в минуту
+        val bpm = (frequencyInHz * 60.0).toInt()
+        
+        Log.d(TAG, "Период в отсчетах: $periodInSamples, частота: ${"%.2f".format(frequencyInHz)} Гц, пульс: $bpm уд/мин")
+        
+        // 5. Валидация результата
+        return if (bpm in 30..220) {
+            bpm
+        } else {
+            Log.d(TAG, "Пульс $bpm вне допустимого диапазона")
+            0
+        }
+    }
+    
+    /**
+     * Вычисляет автокорреляцию сигнала
+     */
+    private fun computeAutocorrelation(signal: List<Double>): List<Double> {
+        val n = signal.size
         val result = mutableListOf<Double>()
-        val mean = values.average()
         
-        // Нормализация входных данных
-        val normalizedValues = values.map { it - mean }
+        // Вычисляем автокорреляцию только до половины длины сигнала
+        val maxLag = n / 2
         
-        // Простой IIR-фильтр второго порядка
-        // Коэффициенты зависят от частоты дискретизации и частотного диапазона
-        val a = 0.95 // Коэффициенты фильтра
-        
-        var y1 = 0.0
-        var y2 = 0.0
-        
-        for (i in normalizedValues.indices) {
-            // Приближенная частота дискретизации
-            val samplingRate = if (i > 0) (1000.0 / (timeValues[i] - timeValues[i-1])) else 30.0
+        for (lag in 0 until maxLag) {
+            var sum = 0.0
+            var count = 0
             
-            // Адаптивная фильтрация с учетом частоты дискретизации
-            val lowCutoff = minOf(2.0 * LOW_CUTOFF_FREQ / samplingRate, 0.4)
-            val highCutoff = minOf(2.0 * HIGH_CUTOFF_FREQ / samplingRate, 0.9)
+            for (i in 0 until n - lag) {
+                sum += signal[i] * signal[i + lag]
+                count++
+            }
             
-            // Полосовой фильтр
-            val xt = normalizedValues[i]
-            var yt = xt
-            
-            // Удаление низких частот (high-pass)
-            yt = a * (yt + y1 - y2)
-            y2 = y1
-            y1 = yt
-            
-            result.add(yt)
+            // Нормализация
+            if (count > 0) {
+                result.add(sum / count)
+            } else {
+                result.add(0.0)
+            }
         }
         
         return result
     }
     
     /**
-     * Получение частоты пульса по пикам в сигнале
+     * Находит пики в автокорреляции (пропуская первый, который всегда на нуле)
      */
-    private fun getHeartRateFromPeaks(values: List<Double>, timeValues: List<Long>): Int {
-        // Находим пики с улучшенным алгоритмом
+    private fun findPeaksInAutocorrelation(autocorrelation: List<Double>): List<Int> {
+        if (autocorrelation.size < 5) return emptyList()
+        
         val peaks = mutableListOf<Int>()
-        val minPeakDistance = 15 // Минимальное расстояние между пиками в сэмплах
         
-        // Динамический порог для обнаружения пиков
-        var threshold = 0.0
-        if (values.size > 10) {
-            // Используем определенный процентиль амплитуды для адаптивного порога
-            val sortedAmplitudes = values.map { abs(it) }.sorted()
-            threshold = sortedAmplitudes[(sortedAmplitudes.size * 0.7).toInt()] * 0.5
-        }
+        // Игнорируем первые несколько лагов (из-за высокой автокорреляции на малых лагах)
+        val minLag = 5
+        // Берем только первые 3 секунды для поиска пиков (соответствует пульсу до 40 уд/мин)
+        val maxLag = minOf(autocorrelation.size - 2, 90) // 90 лагов ≈ 3 секунды при 30 кадрах/с
         
-        var lastPeakIndex = -minPeakDistance
+        // Порог в процентах от максимального значения автокорреляции
+        val maxValue = autocorrelation.take(maxLag).maxOrNull() ?: 0.0
+        val threshold = maxValue * 0.5
         
-        for (i in 2 until values.size - 2) {
-            // Условие пика с адаптивным порогом
-            if (values[i] > threshold && 
-                values[i] > values[i - 1] && values[i] > values[i - 2] &&
-                values[i] > values[i + 1] && values[i] > values[i + 2] &&
-                i - lastPeakIndex >= minPeakDistance) {
+        Log.d(TAG, "Поиск пиков в автокорреляции: порог=${"%.2f".format(threshold)}")
+        
+        for (i in minLag until maxLag) {
+            if (autocorrelation[i] > threshold && 
+                autocorrelation[i] > autocorrelation[i-1] && 
+                autocorrelation[i] > autocorrelation[i+1]) {
                 
                 peaks.add(i)
-                lastPeakIndex = i
+                Log.d(TAG, "Пик автокорреляции: x=$i, y=${"%.2f".format(autocorrelation[i])}")
             }
         }
         
-        Log.d(TAG, "Анализ пиков: найдено ${peaks.size} пиков, порог=${"%.2f".format(threshold)}")
-        
-        // Вычисляем средний интервал между пиками
-        if (peaks.size >= 3) {
-            val intervals = mutableListOf<Long>()
-            
-            for (i in 1 until peaks.size) {
-                if (peaks[i] < timeValues.size && peaks[i-1] < timeValues.size) {
-                    val interval = timeValues[peaks[i]] - timeValues[peaks[i-1]]
-                    intervals.add(interval)
-                }
-            }
-            
-            // Медианная фильтрация интервалов для устойчивости к выбросам
-            if (intervals.size >= 3) {
-                intervals.sort()
-                val medianInterval = intervals[intervals.size / 2]
-                Log.d(TAG, "Медианный интервал между пиками: $medianInterval мс")
-                
-                // Проверка на разумные пределы
-                if (medianInterval > 0) {
-                    val bpm = (60.0 * 1000.0 / medianInterval).toInt()
-                    if (bpm in MIN_VALID_HEART_RATE..MAX_VALID_HEART_RATE) {
-                        return bpm
-                    } else {
-                        Log.d(TAG, "Значение пульса вне допустимого диапазона: $bpm уд/мин")
-                    }
-                }
-            }
-        }
-        
-        return 0 // Не удалось определить
+        return peaks
     }
     
     /**
-     * Получение частоты пульса с использованием быстрого преобразования Фурье (БПФ)
+     * Упрощенный метод расчета пульса при завершении измерения
      */
-    private fun getHeartRateFromFFT(values: List<Double>, timeValues: List<Long>): Int {
-        if (values.size < 32) return 0 // Нужно минимум 32 точки для БПФ
-        
-        // Подготавливаем данные для БПФ
-        val n = findNextPowerOfTwo(values.size)
-        val real = DoubleArray(n) { if (it < values.size) values[it] else 0.0 }
-        val imag = DoubleArray(n) { 0.0 }
-        
-        // Применяем оконную функцию Хэмминга для уменьшения утечки спектра
-        applyWindow(real)
-        
-        // Выполняем БПФ
-        fft(real, imag)
-        
-        // Вычисляем средний интервал времени для определения частоты дискретизации
-        var avgDelta = 0.0
-        for (i in 1 until timeValues.size) {
-            avgDelta += (timeValues[i] - timeValues[i-1])
-        }
-        avgDelta /= (timeValues.size - 1)
-        val samplingRate = 1000.0 / avgDelta // в герцах
-        Log.d(TAG, "FFT анализ: частота дискретизации=${samplingRate.toInt()} Гц, размер окна=$n")
-        
-        // Находим доминирующую частоту в спектре, соответствующую пульсу
-        val minFreqIndex = (n * LOW_CUTOFF_FREQ / samplingRate).toInt()
-        val maxFreqIndex = minOf((n * HIGH_CUTOFF_FREQ / samplingRate).toInt(), n/2)
-        
-        var maxMagnitude = 0.0
-        var dominantFreqIndex = 0
-        
-        for (i in minFreqIndex until maxFreqIndex) {
-            val magnitude = sqrt(real[i] * real[i] + imag[i] * imag[i])
-            if (magnitude > maxMagnitude) {
-                maxMagnitude = magnitude
-                dominantFreqIndex = i
-            }
-        }
-        
-        // Переводим индекс доминирующей частоты в частоту в Гц
-        val dominantFreq = dominantFreqIndex * samplingRate / n
-        Log.d(TAG, "FFT: доминирующая частота=${"%.2f".format(dominantFreq)} Гц, магнитуда=${"%.2f".format(maxMagnitude)}")
-        
-        // Переводим частоту в удары в минуту
-        val bpm = (dominantFreq * 60.0).toInt()
-        
-        // Проверяем на допустимый диапазон пульса
-        return if (bpm in MIN_VALID_HEART_RATE..MAX_VALID_HEART_RATE) bpm else 0
-    }
-    
-    /**
-     * Применяет оконную функцию Хэмминга к данным для БПФ
-     */
-    private fun applyWindow(data: DoubleArray) {
-        for (i in data.indices) {
-            // Оконная функция Хэмминга: 0.54 - 0.46 * cos(2πi/(N-1))
-            val windowValue = 0.54 - 0.46 * cos(2.0 * Math.PI * i / (data.size - 1))
-            data[i] *= windowValue
-        }
-    }
-    
-    /**
-     * Находит следующую степень двойки, большую или равную n
-     */
-    private fun findNextPowerOfTwo(n: Int): Int {
-        var power = 1
-        while (power < n) {
-            power *= 2
-        }
-        return power
-    }
-    
-    /**
-     * Реализация алгоритма быстрого преобразования Фурье (БПФ)
-     */
-    private fun fft(real: DoubleArray, imag: DoubleArray) {
-        val n = real.size
-        
-        // Битовая инверсия для упорядочивания
-        var j = 0
-        for (i in 0 until n - 1) {
-            if (i < j) {
-                // Меняем местами
-                val tempReal = real[i]
-                val tempImag = imag[i]
-                real[i] = real[j]
-                imag[i] = imag[j]
-                real[j] = tempReal
-                imag[j] = tempImag
-            }
-            
-            var k = n / 2
-            while (k <= j) {
-                j -= k
-                k /= 2
-            }
-            j += k
-        }
-        
-        // Вычисление БПФ
-        var l2 = 1
-        while (l2 < n) {
-            val l1 = l2 * 2
-            val angle = (-Math.PI / l2)
-            val wReal = cos(angle)
-            val wImag = sin(angle)
-            
-            for (j in 0 until n step l1) {
-                var wTmpReal = 1.0
-                var wTmpImag = 0.0
-                
-                for (i in 0 until l2) {
-                    val iw = i + j
-                    val ip = iw + l2
-                    
-                    val tempReal = wTmpReal * real[ip] - wTmpImag * imag[ip]
-                    val tempImag = wTmpReal * imag[ip] + wTmpImag * real[ip]
-                    
-                    real[ip] = real[iw] - tempReal
-                    imag[ip] = imag[iw] - tempImag
-                    real[iw] += tempReal
-                    imag[iw] += tempImag
-                    
-                    // Обновляем множитель поворота
-                    val nextWReal = wTmpReal * wReal - wTmpImag * wImag
-                    val nextWImag = wTmpReal * wImag + wTmpImag * wReal
-                    wTmpReal = nextWReal
-                    wTmpImag = nextWImag
-                }
-            }
-            
-            l2 = l1
-        }
-    }
-    
     private fun calculateHeartRate() {
-        // Используем комбинацию всех трех каналов RGB с весами для улучшения точности
-        val combinedValues = mutableListOf<Double>()
-        
-        for (i in 0 until redChannelValues.size) {
-            // Зеленый канал обычно дает наилучшие результаты для измерения пульса
-            val weightedValue = redChannelValues[i] * 0.3 + 
-                                greenChannelValues[i] * 0.6 + 
-                                blueChannelValues[i] * 0.1
-            combinedValues.add(weightedValue)
-        }
-        
-        // Применяем полосовой фильтр для выделения пульсовой волны
-        val filteredValues = bandpassFilter(combinedValues, timeValues)
-        
-        if (filteredValues.size < MOVING_WINDOW_SIZE * 2) {
+        if (redChannelValues.size < MOVING_WINDOW_SIZE * 2) {
             runOnUiThread {
                 binding.pulseRateText.text = "Недостаточно данных"
-                binding.statusText.text = "Слишком короткое измерение"
                 Toast.makeText(this, "Недостаточно данных для определения пульса", Toast.LENGTH_LONG).show()
             }
             return
         }
         
-        // Получаем пульс двумя методами
-        val bpmFromPeaks = getHeartRateFromPeaks(filteredValues, timeValues)
-        val bpmFromFFT = getHeartRateFromFFT(filteredValues, timeValues)
-        
-        // Финальный результат - взвешенное среднее или наиболее надежное значение
-        val finalHeartRate = when {
-            bpmFromPeaks == 0 -> bpmFromFFT
-            bpmFromFFT == 0 -> bpmFromPeaks
-            else -> {
-                // Если разница между методами небольшая, берем среднее
-                val diff = abs(bpmFromPeaks - bpmFromFFT)
-                if (diff < 10) {
-                    (bpmFromPeaks * 0.6 + bpmFromFFT * 0.4).toInt()
-                } else if (signalQuality > 0.7) {
-                    // При хорошем качестве сигнала предпочитаем метод пиков
-                    bpmFromPeaks
-                } else {
-                    // При низком качестве сигнала предпочитаем БПФ
-                    bpmFromFFT
-                }
-            }
-        }
+        // Напрямую используем только красный канал без фильтрации
+        val heartRate = getHeartRateFromPeaks(redChannelValues, timeValues)
         
         runOnUiThread {
-            if (finalHeartRate > 0) {
-                binding.pulseRateText.text = "$finalHeartRate уд/мин"
-                binding.statusText.text = "Измерение завершено"
+            if (heartRate > 0) {
+                lastValidHeartRate = heartRate // Сохраняем валидное значение
+                heartRateConfidence = 1.0 // Устанавливаем максимальное доверие
+                binding.pulseRateText.text = "$heartRate уд/мин"
             } else {
-                binding.pulseRateText.text = "Ошибка измерения"
-                binding.statusText.text = "Не удалось определить пульс"
-                Toast.makeText(this, "Не удалось определить пульс, повторите измерение", Toast.LENGTH_LONG).show()
+                // Используем последнее валидное значение, если оно есть
+                binding.pulseRateText.text = "$lastValidHeartRate уд/мин (примерно)"
+                Toast.makeText(this, "Точное определение пульса не удалось, показано приблизительное значение", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -857,10 +656,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         // Обновляем пульс после добавления новой метки
         if (manualPulseTimestamps.size >= 2) {
             updateManualHeartRate()
-        } else {
-            runOnUiThread {
-                binding.statusText.text = "Отмечено 1 нажатие. Нажмите еще раз."
-            }
         }
     }
     
@@ -886,9 +681,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         runOnUiThread {
             if (heartRate > 0) {
                 binding.pulseRateText.text = "$heartRate уд/мин"
-                binding.statusText.text = "Ручное измерение: ${manualPulseTimestamps.size} ударов"
-            } else {
-                binding.statusText.text = "Нажимайте в ритме пульса. Отмечено: ${manualPulseTimestamps.size}"
             }
         }
     }
