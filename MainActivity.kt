@@ -1,153 +1,59 @@
-package com.example.myapplication
-
-import android.content.Context
-import android.os.*
-import android.widget.Button
-import android.widget.TextView
-import android.widget.Toast
-import androidx.activity.enableEdgeToEdge
+import android.os.Bundle
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
+import com.github.mikephil.charting.charts.LineChart
+import com.github.mikephil.charting.data.Entry
+import com.github.mikephil.charting.data.LineData
+import com.github.mikephil.charting.data.LineDataSet
+import com.github.mikephil.charting.utils.ColorTemplate
+import kotlinx.android.synthetic.main.activity_main.*
+import kotlin.random.Random
 
 class MainActivity : AppCompatActivity() {
-    private val pulseRecords = mutableListOf<Long>()
-    private var lastClickTime: Long = 0
-    private lateinit var vibrator: Vibrator
-    private val resetHandler = Handler(Looper.getMainLooper())
-    private val resetRunnable = Runnable { resetMeasurement() }
 
-    // UI элементы
-    private lateinit var pulseButton: Button
-    private lateinit var resultText: TextView
-    private lateinit var pulseDisplay: TextView
+    private val entries = ArrayList<Entry>() // Хранит точки графика
+    private lateinit var lineDataSet: LineDataSet
+    private lateinit var lineData: LineData
+    private var lastXValue = 0f // Последняя координата X
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
         setContentView(R.layout.activity_main)
 
-        initViews()
-        initVibrator()
-        setupButtonClickListener()
-        setupWindowInsets()
-    }
+        setupChart() // Настройка графика
 
-    private fun initViews() {
-        pulseButton = findViewById(R.id.pulseButton)
-        resultText = findViewById(R.id.resultText)
-        pulseDisplay = findViewById(R.id.pulseDisplay)
-    }
-
-    private fun initVibrator() {
-        vibrator = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-    }
-
-    private fun setupButtonClickListener() {
-        pulseButton.setOnClickListener {
-            handlePulseButtonClick()
+        // Обработка нажатия кнопки
+        buttonPulse.setOnClickListener {
+            simulateHeartbeat() // Добавляем "удар сердца" на график
         }
     }
 
-    private fun setupWindowInsets() {
-        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
-            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
-            v.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
-            insets
-        }
+    private fun setupChart() {
+        lineDataSet = LineDataSet(entries, "Пульс")
+        lineDataSet.color = ColorTemplate.MATERIAL_COLORS[0]
+        lineDataSet.setDrawCircles(false) // Убираем точки (для плавности)
+        lineDataSet.lineWidth = 3f
+
+        lineData = LineData(lineDataSet)
+        lineChart.data = lineData
+        lineChart.description.text = "График сердцебиения"
+        lineChart.animateX(1000) // Анимация
     }
 
-    private fun handlePulseButtonClick() {
-        try {
-            vibrateOnClick()
-            val currentTime = SystemClock.elapsedRealtime()
+    private fun simulateHeartbeat() {
+        // Имитация удара сердца (резкий подъем и спад)
+        val baseY = Random.nextFloat() * 2 + 2f // Случайная базовая линия
+        val peakY = baseY + 5f // Пик удара
 
-            if (lastClickTime != 0L) {
-                recordPulseInterval(currentTime)
-            }
+        // Добавляем точки для "удара"
+        entries.add(Entry(lastXValue, baseY))
+        entries.add(Entry(lastXValue + 0.5f, peakY))
+        entries.add(Entry(lastXValue + 1f, baseY))
+        lastXValue += 1.5f
 
-            lastClickTime = currentTime
-            resetAutoResetTimer()
-        } catch (e: Exception) {
-            e.printStackTrace()
-            showErrorToast(e)
-        }
+        // Обновляем график
+        lineDataSet.notifyDataSetChanged()
+        lineData.notifyDataChanged()
+        lineChart.notifyDataSetChanged()
+        lineChart.moveViewToX(lastXValue) // Автоматическая прокрутка
     }
-
-    private fun vibrateOnClick() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator.vibrate(
-                VibrationEffect.createOneShot(
-                    50,
-                    VibrationEffect.DEFAULT_AMPLITUDE
-                )
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(50)
-        }
-    }
-
-    private fun recordPulseInterval(currentTime: Long) {
-        val interval = currentTime - lastClickTime
-        pulseRecords.add(interval)
-
-        pulseDisplay.text = "Записано ${pulseRecords.size} ударов"
-
-        if (pulseRecords.size >= 5) {
-            calculatePulse()
-        }
-    }
-
-    private fun resetAutoResetTimer() {
-        resetHandler.removeCallbacks(resetRunnable)
-        resetHandler.postDelayed(resetRunnable, 2000)
-    }
-
-    private fun calculatePulse() {
-        try {
-            if (pulseRecords.size < 5) {
-                resultText.text = "Нужно минимум 5 нажатий"
-                return
-            }
-
-            val averageInterval = pulseRecords.average()
-            val bpm = (60000 / averageInterval).toInt()
-            val diagram = buildPulseDiagram(bpm)
-
-            resultText.text = diagram
-            resetMeasurement()
-        } catch (e: Exception) {
-            e.printStackTrace()
-            resultText.text = "Ошибка расчета пульса"
-        }
-    }
-
-    private fun buildPulseDiagram(bpm: Int): String {
-        return buildString {
-            append("Ваш пульс: $bpm BPM\n")
-            append("Диаграмма:\n")
-
-            pulseRecords.forEachIndexed { index, interval ->
-                val beats = (interval / 100).toInt()
-                append("${index + 1}: ${"♥".repeat(beats.coerceAtMost(10))}\n")
-            }
-        }
-    }
-
-    private fun resetMeasurement() {
-        pulseRecords.clear()
-        lastClickTime = 0
-        pulseDisplay.text = "Нажмите кнопку в ритме пульса"
-        resetHandler.removeCallbacks(resetRunnable)
-    }
-
-    private fun showErrorToast(e: Exception) {
-        runOnUiThread {
-            Toast.makeText(
-                this@MainActivity,
-                "Ошибка: ${e.localizedMessage}",
-                Toast.LENGTH_SHORT
-            ).show()
-        }
-    }
+}
